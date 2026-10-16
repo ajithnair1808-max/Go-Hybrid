@@ -342,11 +342,25 @@ fn check_stmt_boundaries(ck: &mut Checker<'_>, st: &mut FnState, stmt: &Stmt, ma
             check_body_boundaries(ck, st, block, managed);
             st.scope_pop();
         }
-        Stmt::Assign { values, .. } => {
-            for v in values {
-                ck.mark_move_in_value(st, v, format!("the move-assign `{}`", v.render()));
-            }
-        }
+        Stmt::Assign {
+         targets, values, ..
+     } => {
+         for v in values {
+             ck.mark_move_in_value(st, v, format!("the move-assign `{}`", v.render()));
+         }
+         for (t, v) in targets.iter().zip(values.iter()) {
+             if let hy_syntax::PlaceKind::Ident(lhs) = &t.kind {
+                 if let Expr::Ident { name: rhs_name, .. } = crate::model::unwrap_parens(v) {
+                     if st.env.contains_key(rhs_name)
+                         || st.scopes.iter().any(|s| s.contains_key(rhs_name))
+                     {
+                         let resolved_root = crate::freeze::resolve_alias(st, rhs_name);
+                         st.aliases.insert(lhs.clone(), resolved_root);
+                     }
+                 }
+             }
+         }
+     }
         Stmt::Return { values, .. } => {
             for v in values {
                 ck.mark_move_in_value(st, v, format!("the move-return `{}`", v.render()));
