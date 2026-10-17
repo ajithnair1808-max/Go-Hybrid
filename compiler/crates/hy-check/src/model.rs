@@ -152,6 +152,11 @@ pub(crate) struct Binding {
     /// capture, or non-channel `for ... in` element), so `move x` at a
     /// concurrency boundary cannot freeze all live aliases (O5.1/O5.2/O5.4).
     pub non_owned_origin: Option<String>,
+    /// Defined (or re-assigned) as an O8 map-slot loan `x := &m[k]`.
+    /// T24: a loan is not an addressable value — `&x` on it is
+    /// HYB-E3104. A shadowing redefinition creates a fresh binding with
+    /// this flag off, so the rule stays scope-correct.
+    pub slot_loan: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +240,13 @@ pub(crate) struct FnState {
     /// return-site nil checks). Empty for closure bodies (fn literals
     /// carry no result types on the AST surface yet).
     pub result_shapes: Vec<TypeShape>,
+    /// Declared named result bindings (`fn f() (out map[string]int)`), in
+    /// signature order. A bare `return` reads and returns each named result.
+    pub named_results: Vec<String>,
+    /// Bindings currently holding a function-local `&...` borrow (or a
+    /// composite literal containing `&...`), for O2 `LOAN-ESCAPE` on
+    /// named-result / variable returns (`out = &x; return` / `return out`).
+    pub borrow_bindings: HashSet<String>,
 }
 
 impl FnState {
@@ -611,7 +623,11 @@ pub(crate) fn collect_ref_roots(e: &Expr, out: &mut Vec<String>) {
 pub(crate) fn collect_move_operands<'e>(e: &'e Expr, out: &mut Vec<(&'e Expr, Span)>) {
     match e {
         Expr::Move { operand, span } => {
-            out.push((unwrap_parens(operand), *span));
+            let inner = unwrap_parens(operand);
+            out.push((inner, *span));
+            if !matches!(inner, Expr::Ident { .. }) {
+                collect_move_operands(inner, out);
+            }
         }
         Expr::Paren { inner, .. } => collect_move_operands(inner, out),
         Expr::StructLit { fields, .. } => {
@@ -628,6 +644,42 @@ pub(crate) fn collect_move_operands<'e>(e: &'e Expr, out: &mut Vec<(&'e Expr, Sp
         Expr::SliceLit { items, .. } => {
             for item in items {
                 collect_move_operands(item, out);
+            }
+        }
+        Expr::Field { base, .. } => collect_move_operands(base, out),
+        Expr::Index { base, index, .. } => {
+            collect_move_operands(base, out);
+            collect_move_operands(index, out);
+        }
+        Expr::Slice { base, lo, hi, .. } => {
+            collect_move_operands(base, out);
+            if let Some(l) = lo {
+                collect_move_operands(l, out);
+            }
+            if let Some(h) = hi {
+                collect_move_operands(h, out);
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_move_operands(callee, out);
+            for a in args {
+                collect_move_operands(&a.value, out);
+            }
+        }
+        Expr::Try { operand, .. } => collect_move_operands(operand, out),
+        Expr::Unary { operand, .. } | Expr::AddrOf { operand, .. } => {
+            collect_move_operands(operand, out);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_move_operands(lhs, out);
+            collect_move_operands(rhs, out);
+        }
+        Expr::Receive { chan, .. } => collect_move_operands(chan, out),
+        Expr::Interp { parts, .. } => {
+            for p in parts {
+                if let hy_syntax::InterpPart::Expr(exp) = p {
+                    collect_move_operands(exp, out);
+                }
             }
         }
         _ => {}
